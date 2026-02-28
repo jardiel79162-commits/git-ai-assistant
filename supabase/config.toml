@@ -1,1 +1,10 @@
 project_id = "mjaspucgyjblafgklqdq"
+
+[functions.github-connect]
+verify_jwt = false
+
+[functions.github-chat]
+verify_jwt = false
+
+[functions.github-commit]
+verify_jwt = false
