@@ -35,7 +35,12 @@ async function fetchFileContent(owner: string, repo: string, path: string, token
   if (!resp.ok) return null;
   const data = await resp.json();
   if (data.encoding === "base64" && data.content) {
-    return atob(data.content.replace(/\n/g, ""));
+    const binary = atob(data.content.replace(/\n/g, ""));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new TextDecoder("utf-8").decode(bytes);
   }
   return null;
 }
