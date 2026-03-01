@@ -73,7 +73,7 @@ serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
   try {
-    const { repoUrl, token, instruction } = await req.json();
+    const { repoUrl, token, instruction, conversationHistory } = await req.json();
 
     if (!repoUrl || !token || !instruction) {
       return new Response(JSON.stringify({ error: "repoUrl, token e instruction são obrigatórios" }), {
@@ -115,16 +115,47 @@ serve(async (req) => {
 
     const systemPrompt = `Você é um programador especialista. O usuário vai pedir modificações em um repositório GitHub.
 
-Responda APENAS com um JSON array de objetos com as alterações. Cada objeto deve ter:
-- "file": caminho do arquivo
-- "content": conteúdo completo atualizado do arquivo
-
-Responda APENAS o JSON, sem markdown, sem explicações. Se não houver alterações necessárias, retorne [].
+REGRAS IMPORTANTES:
+1. Responda APENAS com um JSON array de objetos com as alterações.
+2. Cada objeto deve ter: "file" (caminho do arquivo) e "content" (conteúdo completo atualizado do arquivo).
+3. Responda APENAS o JSON, sem markdown, sem explicações.
+4. Se não houver alterações necessárias, retorne [].
+5. MUITO IMPORTANTE: Você DEVE manter todas as alterações anteriores que foram feitas na conversa. Nunca desfaça modificações anteriores a menos que o usuário peça explicitamente.
+6. Ao modificar um arquivo, inclua o conteúdo COMPLETO do arquivo com TODAS as alterações acumuladas.
+7. Você pode modificar múltiplos arquivos de uma vez se necessário.
 
 Arquivos do repositório:
 ${fileContext}
 
 Lista completa de arquivos: ${tree.map((t: any) => t.path).join(", ")}`;
+
+    // Build conversation messages for AI with full history
+    const aiMessages: { role: string; content: string }[] = [
+      { role: "system", content: systemPrompt },
+    ];
+
+    // Add conversation history so AI has context of all previous changes
+    if (conversationHistory && Array.isArray(conversationHistory)) {
+      for (const msg of conversationHistory) {
+        if (msg.role === "user") {
+          aiMessages.push({ role: "user", content: msg.content });
+        } else if (msg.role === "assistant") {
+          // For assistant messages that had file changes, include the files info
+          if (msg.files && msg.files.length > 0) {
+            const filesInfo = msg.files.map((f: any) => `Arquivo modificado: ${f.file}`).join("\n");
+            aiMessages.push({
+              role: "assistant",
+              content: `Modifiquei os seguintes arquivos:\n${filesInfo}\n\n${JSON.stringify(msg.files)}`,
+            });
+          } else {
+            aiMessages.push({ role: "assistant", content: msg.content });
+          }
+        }
+      }
+    }
+
+    // Add current instruction
+    aiMessages.push({ role: "user", content: instruction });
 
     // Call AI
     const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
@@ -138,10 +169,7 @@ Lista completa de arquivos: ${tree.map((t: any) => t.path).join(", ")}`;
       },
       body: JSON.stringify({
         model: "google/gemini-2.5-flash",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: instruction },
-        ],
+        messages: aiMessages,
       }),
     });
 
