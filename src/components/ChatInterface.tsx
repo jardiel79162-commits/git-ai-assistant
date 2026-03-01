@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Send, Loader2, Terminal, GitCommit, LogOut, Check, X, Paperclip, FileIcon, ImageIcon, Film } from "lucide-react";
@@ -30,8 +30,11 @@ interface ChatInterfaceProps {
 }
 
 const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/github-chat`;
+const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+function getChatStorageKey(repoUrl: string) {
+  return `devai-chat-${repoUrl}`;
+}
 
 function formatFileSize(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
@@ -46,7 +49,13 @@ function getFileIcon(type: string) {
 }
 
 const ChatInterface = ({ repoUrl, token, onDisconnect }: ChatInterfaceProps) => {
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<Message[]>(() => {
+    try {
+      const saved = localStorage.getItem(getChatStorageKey(repoUrl));
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return [];
+  });
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<{ file: string; content: string }[] | null>(null);
@@ -58,6 +67,20 @@ const ChatInterface = ({ repoUrl, token, onDisconnect }: ChatInterfaceProps) => 
 
   const repoName = repoUrl.replace("https://github.com/", "");
 
+  // Save messages to localStorage whenever they change
+  useEffect(() => {
+    // Save without attachments dataUrl to avoid localStorage size limits
+    const toSave = messages.map((m) => ({
+      ...m,
+      attachments: m.attachments?.map((a) => ({ ...a, dataUrl: "" })),
+    }));
+    try {
+      localStorage.setItem(getChatStorageKey(repoUrl), JSON.stringify(toSave));
+    } catch {
+      // localStorage full - silently fail
+    }
+  }, [messages, repoUrl]);
+
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isLoading]);
@@ -66,14 +89,11 @@ const ChatInterface = ({ repoUrl, token, onDisconnect }: ChatInterfaceProps) => 
     const files = e.target.files;
     if (!files) return;
 
-    const newAttachments: Attachment[] = [];
-
     Array.from(files).forEach((file) => {
       if (file.size > MAX_FILE_SIZE) {
         toast.error(`${file.name} excede o limite de 10MB`);
         return;
       }
-
       const reader = new FileReader();
       reader.onload = () => {
         const attachment: Attachment = {
@@ -87,13 +107,21 @@ const ChatInterface = ({ repoUrl, token, onDisconnect }: ChatInterfaceProps) => 
       reader.readAsDataURL(file);
     });
 
-    // Reset input
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
   const removeAttachment = (index: number) => {
     setAttachments((prev) => prev.filter((_, i) => i !== index));
   };
+
+  // Build conversation history for AI context (without file contents to save tokens on older messages)
+  const buildConversationHistory = useCallback(() => {
+    return messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+      files: m.files,
+    }));
+  }, [messages]);
 
   const sendMessage = async () => {
     const trimmed = input.trim();
@@ -112,14 +140,12 @@ const ChatInterface = ({ repoUrl, token, onDisconnect }: ChatInterfaceProps) => 
     setIsLoading(true);
 
     try {
-      const bodyPayload: any = { repoUrl, token, instruction: trimmed };
-
-      // Include text-based file contents in the instruction context
+      let finalInstruction = trimmed;
       if (currentAttachments.length > 0) {
         const fileDescriptions = currentAttachments
           .map((a) => `[Arquivo anexado: ${a.name} (${a.type}, ${formatFileSize(a.size)})]`)
           .join("\n");
-        bodyPayload.instruction = `${trimmed}\n\nArquivos anexados:\n${fileDescriptions}`;
+        finalInstruction = `${trimmed}\n\nArquivos anexados:\n${fileDescriptions}`;
       }
 
       const resp = await fetch(CHAT_URL, {
@@ -128,7 +154,12 @@ const ChatInterface = ({ repoUrl, token, onDisconnect }: ChatInterfaceProps) => 
           "Content-Type": "application/json",
           Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
         },
-        body: JSON.stringify(bodyPayload),
+        body: JSON.stringify({
+          repoUrl,
+          token,
+          instruction: finalInstruction,
+          conversationHistory: buildConversationHistory(),
+        }),
       });
 
       if (resp.status === 429) { toast.error("Muitas requisições. Aguarde um momento."); setIsLoading(false); return; }
@@ -261,7 +292,6 @@ const ChatInterface = ({ repoUrl, token, onDisconnect }: ChatInterfaceProps) => 
             <div key={msg.id} className="animate-fade-in">
               <MessageBubble message={msg} />
 
-              {/* Attachments preview */}
               {msg.attachments && msg.attachments.length > 0 && (
                 <div className={`flex flex-wrap gap-2 mt-2 ${msg.role === "user" ? "justify-end" : ""}`}>
                   {msg.attachments.map((att, i) => (
