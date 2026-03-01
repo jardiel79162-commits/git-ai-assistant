@@ -51,7 +51,8 @@ function identifyMainFiles(files: any[]): string[] {
     /^(index|app|main)\.(tsx?|jsx?|html)$/,
     /^src\/pages\/.+\.(tsx?|jsx?)$/,
     /^src\/components\/.+\.(tsx?|jsx?)$/,
-    /^(package\.json|README\.md)$/,
+    /^src\/styles\/.+\.(css|scss|less)$/,
+    /^(package\.json|README\.md|tsconfig\.json|vite\.config\.\w+)$/,
   ];
 
   const paths = files.map((f: any) => f.path);
@@ -63,10 +64,36 @@ function identifyMainFiles(files: any[]): string[] {
         selected.push(p);
       }
     }
-    if (selected.length >= 10) break;
+    if (selected.length >= 15) break;
   }
 
-  return selected.slice(0, 10);
+  return selected.slice(0, 15);
+}
+
+function extractJsonArray(text: string): any[] | null {
+  // Try direct parse first
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) return parsed;
+  } catch {}
+
+  // Remove markdown code fences
+  const cleaned = text.replace(/```(?:json)?\s*/g, "").replace(/```\s*/g, "").trim();
+  try {
+    const parsed = JSON.parse(cleaned);
+    if (Array.isArray(parsed)) return parsed;
+  } catch {}
+
+  // Try to find JSON array in the text
+  const match = cleaned.match(/\[[\s\S]*\]/);
+  if (match) {
+    try {
+      const parsed = JSON.parse(match[0]);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {}
+  }
+
+  return null;
 }
 
 serve(async (req) => {
@@ -99,53 +126,57 @@ serve(async (req) => {
     const tree = await fetchRepoTree(owner, repo, token, branch);
     const mainFiles = identifyMainFiles(tree);
 
-    // Fetch content of main files
-    const fileContents: { path: string; content: string }[] = [];
-    for (const path of mainFiles) {
-      const content = await fetchFileContent(owner, repo, path, token);
-      if (content) {
-        fileContents.push({ path, content });
-      }
-    }
+    // Fetch content of main files in parallel
+    const fileResults = await Promise.all(
+      mainFiles.map(async (path) => {
+        const content = await fetchFileContent(owner, repo, path, token);
+        return content ? { path, content } : null;
+      })
+    );
+    const fileContents = fileResults.filter(Boolean) as { path: string; content: string }[];
 
     // Build prompt for AI
     const fileContext = fileContents
       .map((f) => `--- ${f.path} ---\n${f.content}`)
       .join("\n\n");
 
-    const systemPrompt = `Você é um programador especialista. O usuário vai pedir modificações em um repositório GitHub.
+    const systemPrompt = `Você é um programador especialista que modifica código de repositórios GitHub.
 
-REGRAS IMPORTANTES:
-1. Responda APENAS com um JSON array de objetos com as alterações.
-2. Cada objeto deve ter: "file" (caminho do arquivo) e "content" (conteúdo completo atualizado do arquivo).
-3. Responda APENAS o JSON, sem markdown, sem explicações.
-4. Se não houver alterações necessárias, retorne [].
-5. MUITO IMPORTANTE: Você DEVE manter todas as alterações anteriores que foram feitas na conversa. Nunca desfaça modificações anteriores a menos que o usuário peça explicitamente.
-6. Ao modificar um arquivo, inclua o conteúdo COMPLETO do arquivo com TODAS as alterações acumuladas.
-7. Você pode modificar múltiplos arquivos de uma vez se necessário.
+REGRAS OBRIGATÓRIAS:
+1. Você DEVE SEMPRE responder com um JSON array válido. NUNCA responda com texto explicativo.
+2. Cada objeto do array deve ter exatamente: {"file": "caminho/arquivo", "content": "conteúdo completo"}
+3. Se a instrução pede uma mudança, você DEVE fazer a mudança. Nunca diga que não há alterações quando o usuário pediu algo.
+4. MANTENHA todas as alterações anteriores da conversa. Nunca desfaça mudanças a menos que o usuário peça.
+5. Inclua o conteúdo COMPLETO do arquivo, não apenas trechos.
+6. Pode modificar MÚLTIPLOS arquivos de uma vez.
+7. Se precisar criar um novo arquivo, crie-o.
+
+FORMATO DA RESPOSTA (OBRIGATÓRIO):
+[{"file": "src/App.tsx", "content": "conteúdo completo aqui"}]
+
+Se realmente não houver nada para alterar, retorne: [{"file": "README.md", "content": "conteúdo atual"}] com uma mudança mínima explicando.
+
+NUNCA retorne [] vazio. SEMPRE faça a modificação pedida.
 
 Arquivos do repositório:
 ${fileContext}
 
 Lista completa de arquivos: ${tree.map((t: any) => t.path).join(", ")}`;
 
-    // Build conversation messages for AI with full history
+    // Build conversation messages
     const aiMessages: { role: string; content: string }[] = [
       { role: "system", content: systemPrompt },
     ];
 
-    // Add conversation history so AI has context of all previous changes
     if (conversationHistory && Array.isArray(conversationHistory)) {
       for (const msg of conversationHistory) {
         if (msg.role === "user") {
           aiMessages.push({ role: "user", content: msg.content });
         } else if (msg.role === "assistant") {
-          // For assistant messages that had file changes, include the files info
           if (msg.files && msg.files.length > 0) {
-            const filesInfo = msg.files.map((f: any) => `Arquivo modificado: ${f.file}`).join("\n");
             aiMessages.push({
               role: "assistant",
-              content: `Modifiquei os seguintes arquivos:\n${filesInfo}\n\n${JSON.stringify(msg.files)}`,
+              content: JSON.stringify(msg.files),
             });
           } else {
             aiMessages.push({ role: "assistant", content: msg.content });
@@ -154,59 +185,82 @@ Lista completa de arquivos: ${tree.map((t: any) => t.path).join(", ")}`;
       }
     }
 
-    // Add current instruction
     aiMessages.push({ role: "user", content: instruction });
 
-    // Call AI
     const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
     if (!LOVABLE_API_KEY) throw new Error("LOVABLE_API_KEY não configurada");
 
-    const aiResp = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${LOVABLE_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "google/gemini-2.5-flash",
-        messages: aiMessages,
-      }),
-    });
-
-    if (aiResp.status === 429) {
-      return new Response(JSON.stringify({ error: "Rate limit excedido. Tente novamente em instantes." }), {
-        status: 429,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-    if (aiResp.status === 402) {
-      return new Response(JSON.stringify({ error: "Créditos insuficientes." }), {
-        status: 402,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-    if (!aiResp.ok) throw new Error("Erro na API de IA");
-
-    const aiData = await aiResp.json();
-    const aiContent = aiData.choices?.[0]?.message?.content || "[]";
-
-    // Parse JSON from AI response
+    // Call AI with retry
     let files: { file: string; content: string }[] = [];
-    try {
-      const cleaned = aiContent.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-      const parsed = JSON.parse(cleaned);
-      if (Array.isArray(parsed)) {
-        files = parsed.map((f: any) => ({ file: f.file || f.path, content: f.content }));
+    let lastError = "";
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const messagesForAttempt = attempt === 0
+        ? aiMessages
+        : [
+            ...aiMessages,
+            {
+              role: "user",
+              content: "Sua resposta anterior não era um JSON válido. Responda APENAS com um JSON array válido no formato [{\"file\": \"caminho\", \"content\": \"conteúdo\"}]. Sem texto, sem markdown, APENAS JSON.",
+            },
+          ];
+
+      const aiResp = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${LOVABLE_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "google/gemini-2.5-flash",
+          messages: messagesForAttempt,
+        }),
+      });
+
+      if (aiResp.status === 429) {
+        return new Response(JSON.stringify({ error: "Rate limit excedido. Tente novamente em instantes." }), {
+          status: 429,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
       }
-    } catch {
-      console.error("Failed to parse AI response:", aiContent);
+      if (aiResp.status === 402) {
+        return new Response(JSON.stringify({ error: "Créditos insuficientes." }), {
+          status: 402,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      if (!aiResp.ok) throw new Error("Erro na API de IA");
+
+      const aiData = await aiResp.json();
+      const aiContent = aiData.choices?.[0]?.message?.content || "";
+
+      console.log(`Attempt ${attempt + 1} - AI response length: ${aiContent.length}`);
+
+      const parsed = extractJsonArray(aiContent);
+      if (parsed && parsed.length > 0) {
+        files = parsed
+          .filter((f: any) => (f.file || f.path) && f.content)
+          .map((f: any) => ({ file: f.file || f.path, content: f.content }));
+        if (files.length > 0) break;
+      }
+
+      lastError = aiContent.substring(0, 200);
+      console.log(`Attempt ${attempt + 1} failed to parse. Preview: ${lastError}`);
+    }
+
+    if (files.length === 0) {
+      console.error("All attempts failed. Last response:", lastError);
+      return new Response(JSON.stringify({
+        files: [],
+        message: "⚠️ A IA teve dificuldade em processar sua instrução. Tente reformular o pedido de forma mais específica, mencionando o arquivo que deseja alterar.",
+      }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
     return new Response(JSON.stringify({
       files,
-      message: files.length > 0
-        ? `Preparei ${files.length} arquivo(s) para modificação. Revise e confirme o commit.`
-        : "A IA não identificou alterações necessárias para esta instrução.",
+      message: `Preparei ${files.length} arquivo(s) para modificação. Revise e confirme o commit.`,
     }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
